@@ -27,52 +27,21 @@ class InterPatchGating(nn.Module):
         return x * w
 
 
-class MultiscaleLocalConv(nn.Module):
-    """
-    Lighter multiscale local feature extraction with kernels {1, 3, 5}.
-    
-    v2 changes vs v1:
-    - Reduced from {1,3,5,7} to {1,3,5} — fewer params, less overfitting
-    - Added dropout before output for regularization
-    """
-    def __init__(self, patch_num, kernels=(1, 3, 5), dropout=0.1):
-        super(MultiscaleLocalConv, self).__init__()
-        self.n_scales = len(kernels)
-        self.convs = nn.ModuleList([
-            nn.Conv1d(
-                in_channels=patch_num,
-                out_channels=patch_num,
-                kernel_size=k,
-                padding=k // 2,
-                groups=patch_num
-            )
-            for k in kernels
-        ])
-        self.gelu = nn.GELU()
-        self.bn = nn.BatchNorm1d(patch_num)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # x: [B*C, patch_num, patch_len]
-        out = sum(conv(x) for conv in self.convs) / self.n_scales
-        out = self.gelu(out)
-        out = self.bn(out)
-        out = self.dropout(out)
-        return out
-
-
 class GLPatchNetwork(nn.Module):
     """
-    GLPatch v2 dual-stream network.
+    GLPatch v3 dual-stream network.
     
-    v2 changes vs v1:
-    1. REMOVED aggregate Conv1D — it was smoothing the seasonality residual,
-       blurring the sharp patterns the non-linear stream needs to capture.
-    2. LIGHTER multiscale conv — kernels {1,3,5} instead of {1,3,5,7}, with dropout.
-    3. LEARNABLE residual scaling — alpha parameter lets the model learn how
-       much weight to give the new modules vs passing through unchanged.
-       Initialized at 0.1 so training starts close to xPatch behavior.
-    4. KEPT inter-patch gating — demonstrably helps at longer horizons.
+    v3 changes vs v2:
+    1. REMOVED multiscale conv — inter-patch gating alone drives our wins.
+       Fewer params, less overfitting, cleaner architecture.
+    2. MOVED gating AFTER pointwise conv — gates on richer, already-aggregated
+       features rather than raw depthwise output. Less disruptive to the
+       feature space that pointwise conv expects.
+    3. KEPT learnable residual scaling (res_alpha=0.1) around gating.
+    
+    Architecture (seasonality stream):
+        Patching → Embedding → Depthwise+Residual → Pointwise →
+        [Inter-patch Gating with learnable residual] → Flatten Head
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch):
         super(GLPatchNetwork, self).__init__()
@@ -108,22 +77,17 @@ class GLPatchNetwork(nn.Module):
         # Residual Stream (from xPatch)
         self.fc2 = nn.Linear(self.dim, patch_len)
 
-        # [GLCN] Inter-patch Gating: learns global patch importance
-        self.inter_patch_gate = InterPatchGating(self.patch_num, reduction=4)
-
-        # [GLCN] Multiscale Local Conv: multi-resolution local features
-        self.multiscale_conv = MultiscaleLocalConv(self.patch_num,
-                                                   kernels=(1, 3, 5),
-                                                   dropout=0.1)
-
-        # [v2] Learnable residual scaling — initialized small so the model
-        # starts close to vanilla xPatch and gradually learns to use the new modules
-        self.res_alpha = nn.Parameter(torch.tensor(0.1))
-
         # CNN Pointwise (from xPatch)
         self.conv2 = nn.Conv1d(self.patch_num, self.patch_num, 1, 1)
         self.gelu3 = nn.GELU()
         self.bn3 = nn.BatchNorm1d(self.patch_num)
+
+        # [GLCN] Inter-patch Gating — now AFTER pointwise conv
+        # Gates on richer, already-aggregated inter-patch features
+        self.inter_patch_gate = InterPatchGating(self.patch_num, reduction=4)
+
+        # [v2+] Learnable residual scaling
+        self.res_alpha = nn.Parameter(torch.tensor(0.1))
 
         # Flatten Head (from xPatch)
         self.flatten1 = nn.Flatten(start_dim=-2)
@@ -186,20 +150,19 @@ class GLPatchNetwork(nn.Module):
         # Residual Stream
         res = self.fc2(res)
         s = s + res
-        # s: [B*C, patch_num, patch_len]
-
-        # [GLCN modules with learnable residual scaling]
-        s_base = s  # save baseline (xPatch-equivalent output)
-
-        s = self.inter_patch_gate(s)        # global patch importance
-        s = self.multiscale_conv(s)         # multi-resolution local features
-
-        s = s_base + self.res_alpha * s     # scaled residual
 
         # CNN Pointwise
         s = self.conv2(s)
         s = self.gelu3(s)
         s = self.bn3(s)
+        # s: [B*C, patch_num, patch_len] — rich, aggregated features
+
+        # [GLCN] Inter-patch Gating with learnable residual
+        s_base = s
+        s_gated = self.inter_patch_gate(s)
+        s = s_base + self.res_alpha * (s_gated - s_base)
+        # When res_alpha→0: s≈s_base (vanilla xPatch)
+        # When res_alpha→1: s≈s_gated (full gating)
 
         # Flatten Head
         s = self.flatten1(s)
