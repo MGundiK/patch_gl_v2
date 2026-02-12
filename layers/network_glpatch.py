@@ -8,9 +8,6 @@ class InterPatchGating(nn.Module):
     
     Captures global dynamics by learning patch importance weights:
     GlobalAvgPool (over features) → MLP → Sigmoid → element-wise scaling.
-    
-    This explicitly models which temporal patches carry more predictive
-    information — something xPatch's pointwise conv only does implicitly.
     """
     def __init__(self, patch_num, reduction=4):
         super(InterPatchGating, self).__init__()
@@ -32,16 +29,13 @@ class InterPatchGating(nn.Module):
 
 class MultiscaleLocalConv(nn.Module):
     """
-    GLCN-inspired multiscale local feature extraction.
+    Lighter multiscale local feature extraction with kernels {1, 3, 5}.
     
-    Parallel depthwise convolutions with kernels {1, 3, 5, 7} capture local
-    temporal patterns at multiple resolutions within each patch. This is richer
-    than xPatch's single-scale depthwise conv.
-    
-    Each conv is grouped (depthwise) to maintain per-patch independence.
-    Outputs are averaged (not summed) for magnitude stability.
+    v2 changes vs v1:
+    - Reduced from {1,3,5,7} to {1,3,5} — fewer params, less overfitting
+    - Added dropout before output for regularization
     """
-    def __init__(self, patch_num, kernels=(1, 3, 5, 7)):
+    def __init__(self, patch_num, kernels=(1, 3, 5), dropout=0.1):
         super(MultiscaleLocalConv, self).__init__()
         self.n_scales = len(kernels)
         self.convs = nn.ModuleList([
@@ -56,31 +50,29 @@ class MultiscaleLocalConv(nn.Module):
         ])
         self.gelu = nn.GELU()
         self.bn = nn.BatchNorm1d(patch_num)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         # x: [B*C, patch_num, patch_len]
         out = sum(conv(x) for conv in self.convs) / self.n_scales
         out = self.gelu(out)
         out = self.bn(out)
+        out = self.dropout(out)
         return out
 
 
 class GLPatchNetwork(nn.Module):
     """
-    GLPatch dual-stream network combining xPatch and GLCN innovations.
+    GLPatch v2 dual-stream network.
     
-    Seasonality (non-linear) stream:
-        1. Aggregate Conv1D (GLCN)     — smooths patch boundary transitions
-        2. Overlapping patching (xPatch) — richer temporal context
-        3. Patch embedding (xPatch)     — project to higher-dim space
-        4. Depthwise conv + residual (xPatch) — per-patch feature extraction
-        5. Inter-patch gating (GLCN)    — global patch importance weighting
-        6. Multiscale local conv (GLCN) — multi-resolution local features
-        7. Pointwise conv (xPatch)      — inter-patch feature aggregation
-        8. Flatten MLP head (xPatch)    — project to prediction length
-    
-    Trend (linear) stream:
-        Identical to xPatch — pure linear MLP with AvgPool + LayerNorm.
+    v2 changes vs v1:
+    1. REMOVED aggregate Conv1D — it was smoothing the seasonality residual,
+       blurring the sharp patterns the non-linear stream needs to capture.
+    2. LIGHTER multiscale conv — kernels {1,3,5} instead of {1,3,5,7}, with dropout.
+    3. LEARNABLE residual scaling — alpha parameter lets the model learn how
+       much weight to give the new modules vs passing through unchanged.
+       Initialized at 0.1 so training starts close to xPatch behavior.
+    4. KEPT inter-patch gating — demonstrably helps at longer horizons.
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch):
         super(GLPatchNetwork, self).__init__()
@@ -94,17 +86,10 @@ class GLPatchNetwork(nn.Module):
         self.patch_num = (seq_len - patch_len) // stride + 1
 
         # ================================================================
-        # Non-linear Stream (Seasonality) — enhanced with GLCN modules
+        # Non-linear Stream (Seasonality)
         # ================================================================
 
-        # [NEW] Aggregate Conv1D (GLCN): sliding aggregation preserves
-        # edge information between adjacent patches. Initialized as
-        # uniform moving average for stable training start.
-        self.agg_conv = nn.Conv1d(1, 1, kernel_size=patch_len,
-                                  padding='same', bias=False)
-        nn.init.constant_(self.agg_conv.weight, 1.0 / patch_len)
-
-        # Patching
+        # Patching (overlapping, from xPatch)
         if padding_patch == 'end':
             self.padding_patch_layer = nn.ReplicationPad1d((0, stride))
             self.patch_num += 1
@@ -114,7 +99,7 @@ class GLPatchNetwork(nn.Module):
         self.gelu1 = nn.GELU()
         self.bn1 = nn.BatchNorm1d(self.patch_num)
 
-        # CNN Depthwise (from xPatch): reduces dim from patch_len² → patch_len
+        # CNN Depthwise (from xPatch)
         self.conv1 = nn.Conv1d(self.patch_num, self.patch_num,
                                patch_len, patch_len, groups=self.patch_num)
         self.gelu2 = nn.GELU()
@@ -123,14 +108,19 @@ class GLPatchNetwork(nn.Module):
         # Residual Stream (from xPatch)
         self.fc2 = nn.Linear(self.dim, patch_len)
 
-        # [NEW] Inter-patch Gating (GLCN): learns global patch importance
+        # [GLCN] Inter-patch Gating: learns global patch importance
         self.inter_patch_gate = InterPatchGating(self.patch_num, reduction=4)
 
-        # [NEW] Multiscale Local Conv (GLCN): multi-resolution local features
+        # [GLCN] Multiscale Local Conv: multi-resolution local features
         self.multiscale_conv = MultiscaleLocalConv(self.patch_num,
-                                                   kernels=(1, 3, 5, 7))
+                                                   kernels=(1, 3, 5),
+                                                   dropout=0.1)
 
-        # CNN Pointwise (from xPatch): inter-patch feature aggregation
+        # [v2] Learnable residual scaling — initialized small so the model
+        # starts close to vanilla xPatch and gradually learns to use the new modules
+        self.res_alpha = nn.Parameter(torch.tensor(0.1))
+
+        # CNN Pointwise (from xPatch)
         self.conv2 = nn.Conv1d(self.patch_num, self.patch_num, 1, 1)
         self.gelu3 = nn.GELU()
         self.bn3 = nn.BatchNorm1d(self.patch_num)
@@ -144,8 +134,6 @@ class GLPatchNetwork(nn.Module):
         # ================================================================
         # Linear Stream (Trend) — identical to xPatch
         # ================================================================
-        # Pure linear MLP with AvgPool + LayerNorm, no activations.
-        # Emphasizes linear features in the trend component.
         self.fc5 = nn.Linear(seq_len, pred_len * 4)
         self.avgpool1 = nn.AvgPool1d(kernel_size=2)
         self.ln1 = nn.LayerNorm(pred_len * 2)
@@ -177,11 +165,6 @@ class GLPatchNetwork(nn.Module):
 
         # ---- Non-linear Stream ----
 
-        # [NEW] Aggregate Conv1D: smooth patch boundary transitions
-        s = s.unsqueeze(1)          # [B*C, 1, I]
-        s = self.agg_conv(s)        # [B*C, 1, I]
-        s = s.squeeze(1)            # [B*C, I]
-
         # Patching (overlapping, from xPatch)
         if self.padding_patch == 'end':
             s = self.padding_patch_layer(s)
@@ -192,7 +175,6 @@ class GLPatchNetwork(nn.Module):
         s = self.fc1(s)
         s = self.gelu1(s)
         s = self.bn1(s)
-        # s: [B*C, patch_num, dim]
 
         res = s
 
@@ -200,19 +182,19 @@ class GLPatchNetwork(nn.Module):
         s = self.conv1(s)
         s = self.gelu2(s)
         s = self.bn2(s)
-        # s: [B*C, patch_num, patch_len]
 
         # Residual Stream
-        res = self.fc2(res)         # [B*C, patch_num, patch_len]
+        res = self.fc2(res)
         s = s + res
+        # s: [B*C, patch_num, patch_len]
 
-        # [NEW] Inter-patch Gating: weight patches by global importance
-        s_pre = s                   # save for residual around new modules
-        s = self.inter_patch_gate(s)
+        # [GLCN modules with learnable residual scaling]
+        s_base = s  # save baseline (xPatch-equivalent output)
 
-        # [NEW] Multiscale Local Conv: multi-resolution feature extraction
-        s = self.multiscale_conv(s)
-        s = s + s_pre               # residual connection for gradient flow
+        s = self.inter_patch_gate(s)        # global patch importance
+        s = self.multiscale_conv(s)         # multi-resolution local features
+
+        s = s_base + self.res_alpha * s     # scaled residual
 
         # CNN Pointwise
         s = self.conv2(s)
@@ -224,11 +206,9 @@ class GLPatchNetwork(nn.Module):
         s = self.fc3(s)
         s = self.gelu4(s)
         s = self.fc4(s)
-        # s: [B*C, pred_len]
 
         # ---- Linear Stream (identical to xPatch) ----
 
-        # MLP
         t = self.fc5(t)
         t = self.avgpool1(t)
         t = self.ln1(t)
@@ -238,14 +218,13 @@ class GLPatchNetwork(nn.Module):
         t = self.ln2(t)
 
         t = self.fc7(t)
-        # t: [B*C, pred_len]
 
         # ---- Streams Concatenation ----
         x = torch.cat((s, t), dim=1)
         x = self.fc8(x)
 
         # Channel concatenation
-        x = torch.reshape(x, (B, C, self.pred_len))  # [B, C, Output]
-        x = x.permute(0, 2, 1)  # to [Batch, Output, Channel]
+        x = torch.reshape(x, (B, C, self.pred_len))
+        x = x.permute(0, 2, 1)
 
         return x
