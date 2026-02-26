@@ -127,26 +127,114 @@ class Exp_Main_v2(Exp_Basic):
         return preds, trues
 
     def predict_and_save(self, setting: str, split: str, save_root: str = "./predictions"):
-        _, data_loader = self._get_data(flag=split)
-        preds, trues = self._collect_preds_trues(data_loader)
+        """
+        Saves BOTH:
+        - scaled arrays (what the model/dataset currently uses)
+        - original-scale arrays (inverse StandardScaler)
+
+        Output file:
+        {save_root}/{setting}/{split}.npz
+
+        Keys inside npz:
+        preds, trues           -> scaled
+        preds_orig, trues_orig -> original scale (inverse transformed)
+
+        metrics.json will contain both scaled and original metrics.
+        """
+        data_set, data_loader = self._get_data(flag=split)
+        preds, trues = self._collect_preds_trues(data_loader)  # these are SCALED in your current pipeline
+
+        # ---------- inverse transform helper ----------
+        def inverse_to_original(x_scaled: np.ndarray) -> np.ndarray:
+            """
+            x_scaled: [N, pred_len, C_sel]
+            returns:  [N, pred_len, C_sel] in original units
+            """
+            if not hasattr(data_set, "scaler") or data_set.scaler is None:
+                # No scaler available -> cannot invert
+                return x_scaled
+
+            scaler = data_set.scaler
+
+            # If dataset provides inverse_transform (common in Informer-style datasets), prefer it.
+            if hasattr(data_set, "inverse_transform"):
+                try:
+                    x2 = x_scaled.reshape(-1, x_scaled.shape[-1])
+                    x2_inv = data_set.inverse_transform(x2)
+                    return x2_inv.reshape(x_scaled.shape)
+                except Exception:
+                    pass
+
+            # Fallback: manual inverse using scaler.mean_ and scaler.scale_
+            if not (hasattr(scaler, "mean_") and hasattr(scaler, "scale_")):
+                return x_scaled
+
+            mean = np.asarray(scaler.mean_, dtype=np.float32)
+            std = np.asarray(scaler.scale_, dtype=np.float32)
+
+            C_sel = x_scaled.shape[-1]
+
+            # Case A: scaler matches selected channel count
+            if mean.shape[0] == C_sel:
+                mu = mean
+                sig = std
+
+            # Case B: we only saved 1 channel, scaler has many -> assume target is last
+            elif C_sel == 1 and mean.shape[0] > 1:
+                target_idx = -1
+                # Try to locate target column if dataset exposes cols/target
+                if hasattr(data_set, "cols") and hasattr(self.args, "target"):
+                    try:
+                        target_idx = list(data_set.cols).index(self.args.target)
+                    except Exception:
+                        target_idx = -1
+                mu = mean[target_idx:target_idx + 1]
+                sig = std[target_idx:target_idx + 1]
+            else:
+                # Unknown mapping -> return scaled as-is rather than wrong inverse
+                return x_scaled
+
+            return x_scaled * sig.reshape(1, 1, -1) + mu.reshape(1, 1, -1)
+
+        preds_orig = inverse_to_original(preds)
+        trues_orig = inverse_to_original(trues)
 
         save_dir = os.path.join(save_root, setting)
         os.makedirs(save_dir, exist_ok=True)
 
-        np.savez_compressed(os.path.join(save_dir, f"{split}.npz"), preds=preds, trues=trues)
+        np.savez_compressed(
+            os.path.join(save_dir, f"{split}.npz"),
+            preds=preds,               # scaled
+            trues=trues,               # scaled
+            preds_orig=preds_orig,     # original
+            trues_orig=trues_orig,     # original
+        )
 
-        mae, mse = metric(preds, trues)
+        # metrics on scaled
+        mae_s, mse_s = metric(preds, trues)
+        # metrics on original
+        mae_o, mse_o = metric(preds_orig, trues_orig)
+
         metrics_path = os.path.join(save_dir, "metrics.json")
         if os.path.exists(metrics_path):
             with open(metrics_path, "r") as f:
                 metrics = json.load(f)
         else:
             metrics = {}
-        metrics[split] = {"mse": float(mse), "mae": float(mae)}
+
+        metrics[split] = {
+            "scaled": {"mse": float(mse_s), "mae": float(mae_s)},
+            "original": {"mse": float(mse_o), "mae": float(mae_o)},
+        }
+
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
 
-        print(f"[predict_and_save] {setting} | {split}: mse={mse}, mae={mae} -> {save_dir}")
+        print(
+            f"[predict_and_save] {setting} | {split}: "
+            f"scaled(mse={mse_s:.6f}, mae={mae_s:.6f}) "
+            f"orig(mse={mse_o:.6f}, mae={mae_o:.6f}) -> {save_dir}"
+        )
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag="train")
