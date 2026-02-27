@@ -204,10 +204,9 @@ class Exp_Main_v2(Exp_Basic):
 
         np.savez_compressed(
             os.path.join(save_dir, f"{split}.npz"),
-            preds=preds,               # scaled
-            trues=trues,               # scaled
-            preds_orig=preds_orig,     # original
-            trues_orig=trues_orig,     # original
+            # Persist ONLY original scale arrays to keep artifacts small.
+            preds=preds_orig,
+            trues=trues_orig,
         )
 
         # metrics on scaled
