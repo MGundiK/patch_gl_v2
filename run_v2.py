@@ -120,8 +120,8 @@ if args.is_training:
         exp.train(setting)
 
         # Save predictions for train/val/test
-        exp.predict_and_save(setting, "train", save_root=args.pred_save_root)
-        exp.predict_and_save(setting, "val", save_root=args.pred_save_root)
+        #exp.predict_and_save(setting, "train", save_root=args.pred_save_root)
+        #exp.predict_and_save(setting, "val", save_root=args.pred_save_root)
         exp.predict_and_save(setting, "test", save_root=args.pred_save_root)
 
         print(f">>>>>>>testing : {setting}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
