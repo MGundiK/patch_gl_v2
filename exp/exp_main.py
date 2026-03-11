@@ -205,7 +205,7 @@ class Exp_Main(Exp_Basic):
 
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
-        os.remove(best_model_path)
+        #os.remove(best_model_path) save models
 
         return self.model
 
